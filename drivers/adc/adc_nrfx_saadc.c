@@ -129,6 +129,28 @@ static struct driver_data m_data = {
 /* Maximum value of the internal timer interval in microseconds. */
 #define ADC_INTERNAL_TIMER_INTERVAL_MAX_US 128U
 
+static int adc_nrfx_context_lock(struct adc_context *ctx,
+				 bool asynchronous,
+				 struct k_poll_signal *signal)
+{
+	int error = k_sem_take(&ctx->lock, K_MSEC(100));
+
+	if (error != 0) {
+		k_sem_reset(&ctx->lock);
+		return error;
+	}
+
+#ifdef CONFIG_ADC_ASYNC
+	ctx->asynchronous = asynchronous;
+	ctx->signal = signal;
+#else
+	ARG_UNUSED(asynchronous);
+	ARG_UNUSED(signal);
+#endif
+
+	return 0;
+}
+
 /* Forward declaration */
 static void event_handler(const nrfx_saadc_evt_t *event);
 
@@ -622,7 +644,8 @@ static inline uint16_t interval_to_cc(uint16_t interval_us)
 }
 
 static int start_read(const struct device *dev,
-		      const struct adc_sequence *sequence)
+		      const struct adc_sequence *sequence,
+		      bool asynchronous)
 {
 	nrfx_err_t nrfx_err;
 	int error;
@@ -632,6 +655,7 @@ static int start_read(const struct device *dev,
 	uint8_t active_channel_cnt = 0U;
 	uint8_t channel_id = 0U;
 	void *samples_buffer;
+	bool use_blocking_simple = !asynchronous && (sequence->options == NULL);
 
 	/* Signal an error if channel selection is invalid (no channels or
 	 * a non-existing one is selected).
@@ -688,7 +712,7 @@ static int start_read(const struct device *dev,
 		m_data.internal_timer_enabled = false;
 
 		nrfx_err = nrfx_saadc_simple_mode_set(selected_channels, resolution, oversampling,
-						      event_handler);
+						      use_blocking_simple ? NULL : event_handler);
 	}
 
 	if (nrfx_err != NRFX_SUCCESS) {
@@ -727,6 +751,25 @@ static int start_read(const struct device *dev,
 		return -EINVAL;
 	}
 
+	if (use_blocking_simple) {
+		nrfx_err = nrfx_saadc_mode_trigger();
+		if (nrfx_err != NRFX_SUCCESS) {
+			LOG_ERR("Cannot start sampling: 0x%08x", nrfx_err);
+			return -EIO;
+		}
+
+		dmm_buffer_in_release(m_data.mem_reg, m_data.user_buffer,
+				      NRFX_SAADC_SAMPLES_TO_BYTES(active_channel_cnt),
+				      samples_buffer);
+
+		if (has_single_ended(sequence)) {
+			correct_single_ended(sequence, m_data.user_buffer, active_channel_cnt);
+		}
+
+		nrfy_saadc_disable(NRF_SAADC);
+		return 0;
+	}
+
 	adc_context_start_read(&m_data.ctx, sequence);
 
 	return adc_context_wait_for_completion(&m_data.ctx);
@@ -743,8 +786,13 @@ static int adc_nrfx_read(const struct device *dev,
 		return error;
 	}
 
-	adc_context_lock(&m_data.ctx, false, NULL);
-	error = start_read(dev, sequence);
+	error = adc_nrfx_context_lock(&m_data.ctx, false, NULL);
+	if (error != 0) {
+		(void)pm_device_runtime_put(dev);
+		return error;
+	}
+
+	error = start_read(dev, sequence, false);
 	adc_context_release(&m_data.ctx, error);
 
 	if (pm_device_runtime_put(dev)) {
@@ -762,8 +810,12 @@ static int adc_nrfx_read_async(const struct device *dev,
 {
 	int error;
 
-	adc_context_lock(&m_data.ctx, true, async);
-	error = start_read(dev, sequence);
+	error = adc_nrfx_context_lock(&m_data.ctx, true, async);
+	if (error != 0) {
+		return error;
+	}
+
+	error = start_read(dev, sequence, true);
 	adc_context_release(&m_data.ctx, error);
 
 	return error;

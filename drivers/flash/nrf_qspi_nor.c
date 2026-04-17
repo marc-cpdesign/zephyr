@@ -187,12 +187,16 @@ BUILD_ASSERT((IS_EQUAL(INST_0_QER, JESD216_DW15_QER_VAL_NONE)
 	     "Driver only supports NONE, S1B6, S2B1v1, S2B1v4, S2B1v5 or S2B1v6 for quad-enable-requirements");
 
 #define INST_0_4BA DT_INST_PROP_OR(0, enter_4byte_addr, 0)
+#define INST_0_HAS_LOCK DT_INST_PROP_OR(0, has_lock, 0)
+#define INST_0_REQUIRES_ULBPR DT_INST_NODE_HAS_PROP(0, requires_ulbpr)
 #if (INST_0_4BA != 0)
 BUILD_ASSERT(((INST_0_4BA & 0x03) != 0),
 	     "Driver only supports command (0xB7) for entering 4 byte addressing mode");
 BUILD_ASSERT(DT_INST_PROP(0, address_size_32),
 	    "After entering 4 byte addressing mode, 4 byte addressing is expected");
 #endif
+BUILD_ASSERT((INST_0_HAS_LOCK & ~0xFF) == 0,
+	     "Need support for lock clear beyond SR1");
 
 void z_impl_nrf_qspi_nor_xip_enable(const struct device *dev, bool enable);
 void z_vrfy_nrf_qspi_nor_xip_enable(const struct device *dev, bool enable);
@@ -481,7 +485,6 @@ static int qspi_send_cmd(const struct device *dev, const struct qspi_cmd *cmd,
 	return qspi_get_zephyr_ret_code(res);
 }
 
-#if !IS_EQUAL(INST_0_QER, JESD216_DW15_QER_VAL_NONE)
 /* RDSR.  Negative value is error. */
 static int qspi_rdsr(const struct device *dev, uint8_t sr_num)
 {
@@ -593,7 +596,32 @@ static int qspi_wrsr(const struct device *dev, uint8_t sr_val, uint8_t sr_num)
 
 	return rc;
 }
-#endif /* !IS_EQUAL(INST_0_QER, JESD216_DW15_QER_VAL_NONE) */
+
+static int qspi_clear_lock_bits(const struct device *dev)
+{
+	int rc;
+
+	if (INST_0_HAS_LOCK == 0) {
+		return 0;
+	}
+
+	rc = qspi_rdsr(dev, 1);
+	if (rc <= 0) {
+		return (rc < 0) ? rc : 0;
+	}
+
+	if ((rc & INST_0_HAS_LOCK) == 0) {
+		return 0;
+	}
+
+	rc = qspi_wrsr(dev, rc & ~INST_0_HAS_LOCK, 1);
+	if (rc < 0) {
+		LOG_ERR("failed to clear SR1 lock bits 0x%02x (%d)",
+			INST_0_HAS_LOCK, rc);
+	}
+
+	return rc;
+}
 
 /* QSPI erase */
 static int qspi_erase(const struct device *dev, uint32_t addr, uint32_t size)
@@ -1065,10 +1093,24 @@ static int qspi_nor_write_protection_set(const struct device *dev,
 					 bool write_protect)
 {
 	int rc = 0;
-	struct qspi_cmd cmd = {
-		.op_code = ((write_protect) ? SPI_NOR_CMD_WRDI : SPI_NOR_CMD_WREN),
-	};
+	struct qspi_cmd cmd = { 0 };
 
+	if (!write_protect) {
+		if (INST_0_REQUIRES_ULBPR) {
+			cmd.op_code = SPI_NOR_CMD_ULBPR;
+			rc = qspi_send_cmd(dev, &cmd, false);
+			if (rc != 0) {
+				return -EIO;
+			}
+		}
+
+		rc = qspi_clear_lock_bits(dev);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	cmd.op_code = write_protect ? SPI_NOR_CMD_WRDI : SPI_NOR_CMD_WREN;
 	if (qspi_send_cmd(dev, &cmd, false) != 0) {
 		rc = -EIO;
 	}
